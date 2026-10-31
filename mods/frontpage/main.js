@@ -4,7 +4,7 @@
 // optional agent pane (a) via pane.split + hc send.
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
-import { theme, exec, hc, run, panes, knownAgents, setShared, notify } from "herdr";
+import { theme, exec, hc, run, panes, knownAgents, setShared, notify, nextCommand } from "herdr";
 import { Store, detectTopic, estReadMs } from "./store.js";
 import { buildWeights, rank, whyReceipt } from "./rank.js";
 
@@ -49,6 +49,16 @@ export default class Frontpage extends View {
     });
     // feed polling, gently
     cx.timer.every(15 * 60 * 1000, (cx) => cx.spawn(async (cx) => { await this.pollFeeds(); cx.notify(); }));
+    // scriptable keys: "frontpage:<key>" from keys.json or `herdr-app do frontpage.<key>`
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const c = await nextCommand();
+        if (!c) continue;
+        const raw = c.includes(":") ? c.slice(c.lastIndexOf(":") + 1) : c;
+        const k = { d: "enter", down: "j", up: "k", why: "w", open: "enter", dismiss: "x", save: "S", less: "f", more: "m", undo: "u", saved: "v", capture: "c", agent: "a", back: "escape", next: "n", mark: "h", close: "q" }[raw] ?? raw;
+        this.onKey({ key: k }, cx);
+      }
+    });
     this.h.focus();
   }
 
