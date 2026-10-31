@@ -425,14 +425,28 @@ export default class Frontpage extends View {
   }
 
   footer(t, page) {
+    const streak = `day ${this.dayStreak()}`;
     return h_flex()
       .h(24)
       .px(10)
       .items_center()
       .bg(t.chrome)
-      .border_t_1()
+      .border_t(1)
       .border_color(t.border)
-      .child(div().text_size(11).text_color(t.dim).child(this.onboarding ? "m more like this · f less · j/k move · enter when done" : FOOT[page]));
+      .child(div().text_size(11).text_color(t.dim).flex_1().child(this.onboarding ? "m more like this · f less · j/k move · enter when done" : FOOT[page]))
+      .child(div().text_size(11).text_color(t.muted).child(`${streak} · ${this.store.eventCount()} events · local`));
+  }
+
+  /** Consecutive days (UTC) with at least one non-undo ledger event, ending today. */
+  dayStreak() {
+    const days = new Set(
+      this.store.events.filter((e) => e.kind !== "undo").map((e) => Math.floor(e.ts / 86400000))
+    );
+    if (!days.size) return 0;
+    const today = Math.floor(Date.now() / 86400000);
+    let streak = days.has(today) ? 1 : 0;
+    for (let d = today - 1; days.has(d); d--) streak += 1;
+    return streak;
   }
 
   queueBody(t) {
