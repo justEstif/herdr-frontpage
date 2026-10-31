@@ -26,6 +26,13 @@ export default class FrontpageStatus extends View {
       .child(
         div()
           .text_size(11)
+          .text_color(t.accent)
+          .child("[/] rail")
+      )
+      .child(
+        div()
+          .px(6)
+          .text_size(11)
           .text_color(t.dim)
           .child(c.onboarded === false ? "onboarding — rate 5 to tune your queue" : "local only · nothing leaves your machine")
       );
