@@ -1,0 +1,9 @@
+{
+  "id": "root",
+  "type": "column",
+  "theme": "ink",
+  "children": [
+    { "id": "status", "type": "block", "size": { "px": 26 }, "content": { "mod": "frontpage-status" } },
+    { "id": "front", "type": "block", "content": { "mod": "frontpage" } }
+  ]
+}
