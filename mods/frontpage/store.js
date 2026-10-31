@@ -31,7 +31,10 @@ export class Store {
 
   async load() {
     const snapRaw = await readTextFile(this.dir + "/snapshot.json");
-    const ledgerRaw = await readTextFile(this.dir + "/ledger.jsonl") ?? "";
+    const ledgerRaw = (await readTextFile(this.dir + "/ledger.jsonl")) ?? "";
+    this._ledgerExpected = ledgerRaw; // compact() truncates against what we read
+    this._ledgerExists = ledgerRaw !== null && ledgerRaw !== undefined;
+    this._snapExpected = snapRaw; // null only when the snapshot is absent
     let snap = null;
     if (snapRaw) {
       try {
@@ -92,9 +95,12 @@ export class Store {
       appliedThrough: this.appliedThrough,
     };
     const text = JSON.stringify(snap);
-    await writeTextFile(this.dir + "/snapshot.json", text, null);
-    await writeTextFile(this.dir + "/ledger.jsonl", "", this._dirtyLedger || null);
+    await writeTextFile(this.dir + "/snapshot.json", text, this._snapExpected ?? null);
+    this._snapExpected = text;
+    await writeTextFile(this.dir + "/ledger.jsonl", "", this._ledgerExists ? this._ledgerExpected : null);
     this._dirtyLedger = "";
+    this._ledgerExists = true;
+    this._ledgerExpected = "";
   }
 
   _trimForCap() {
@@ -119,7 +125,13 @@ export class Store {
     this._seq += 1;
     ev.seq = this._seq;
     this.events.push(ev);
-    this._dirtyLedger += JSON.stringify(ev) + "\n";
+    const prev = this._ledgerExpected ?? ""; // what we believe is on disk
+    this._dirtyLedger = prev + JSON.stringify(ev) + "\n";
+    this._ledgerExpected = this._dirtyLedger;
+    try {
+      await writeTextFile(this.dir + "/ledger.jsonl", this._dirtyLedger, this._ledgerExists ? prev : null);
+      this._ledgerExists = true;
+    } catch (_e) { /* compact() below reconciles */ }
     if (this._dirtyLedger.length > LEDGER_LIMIT / 2 || this.events.length % 25 === 0) {
       await this.compact();
     }

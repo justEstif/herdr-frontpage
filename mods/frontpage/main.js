@@ -38,7 +38,11 @@ export default class Frontpage extends View {
     this.feedIn.on("submit", () => this.subscribeFeed(cx));
 
     cx.spawn(async (cx) => {
-      await this.store.load();
+      try {
+        await this.store.load();
+      } catch (e) {
+        this.flash = "store failed to load: " + (e?.message ?? e);
+      }
       this.reweigh();
       this.publish();
       cx.notify();
