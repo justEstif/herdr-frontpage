@@ -124,7 +124,10 @@ theme background:
   `store failed to load: …` with an empty queue; switching the layout away and
   back reloads the mod and retries.
 - Mod commands must be single tokens; `herdr-app do frontpage.enter` is
-  rejected — use `frontpage.d` (or the alias names above).
+  rejected — use `frontpage.d` (or the alias names above). `frontpage.p`
+  writes a UI-structure dump to `mods/frontpage/data/debug-<n>.json`
+  (rendered rows with score/selection/why-receipt, counts, page) for
+  scripted verification.
 - `nextCommand()` delivery is fire-and-forget: `herdr-app do` answers `ok`
   even when the mod is busy. Space commands ~1–2s apart when scripting.
 - Capture needs `npx` on PATH and network access; the defuddle path is

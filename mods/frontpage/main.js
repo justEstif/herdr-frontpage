@@ -4,7 +4,7 @@
 // optional agent pane (a) via pane.split + hc send.
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
-import { theme, exec, hc, run, panes, knownAgents, setShared, notify, nextCommand } from "herdr";
+import { theme, exec, hc, run, panes, knownAgents, setShared, notify, nextCommand, writeTextFile } from "herdr";
 import { Store, detectTopic, estReadMs } from "./store.js";
 import { buildWeights, rank, whyReceipt } from "./rank.js";
 
@@ -55,7 +55,8 @@ export default class Frontpage extends View {
         const c = await nextCommand();
         if (!c) continue;
         const raw = c.includes(":") ? c.slice(c.lastIndexOf(":") + 1) : c;
-        const k = { d: "enter", down: "j", up: "k", why: "w", open: "enter", dismiss: "x", save: "S", less: "f", more: "m", undo: "u", saved: "v", capture: "c", agent: "a", back: "escape", next: "n", mark: "h", close: "q" }[raw] ?? raw;
+        const k = { d: "enter", down: "j", up: "k", why: "w", open: "enter", dismiss: "x", save: "S", less: "f", more: "m", undo: "u", saved: "v", capture: "c", agent: "a", mark: "h", next: "n", close: "q", back: "escape", p: "__dump" }[raw] ?? raw;
+        if (k === "__dump") { await this.writeDump(); continue; }
         this.onKey({ key: k }, cx);
       }
     });
@@ -321,7 +322,7 @@ export default class Frontpage extends View {
     const q = this.store.queue();
     const item = q[this.sel] ?? q[q.length - 1];
     if (!item) return;
-    await this.store.act(kind, item.id);
+    await this.store.act(kind === "rate" ? "rate" : kind, item.id, kind === "rate" ? 1 : undefined);
     this.reweigh();
     this.onboardingLeft -= 1;
     this.clampSel();
@@ -388,6 +389,31 @@ export default class Frontpage extends View {
       }
       else if (k === "c") { this.page = "capture"; cx.notify(); }
     }
+  }
+
+  /** UI-structure evidence for scripts: rendered rows, counts, receipts. */
+  async writeDump() {
+    const rows = this.list().map((it, i) => ({
+      i,
+      selected: i === this.sel,
+      title: it.story.title,
+      source: it.story.source,
+      mins: Math.max(1, Math.round(it.story.readMs / 60000)),
+      score: Number(it.score.toFixed(2)),
+      why: this.whyFor === it.story.id ? whyReceipt(it.story, this.weights) : null,
+    }));;
+    const dump = {
+      generatedAt: new Date().toISOString(),
+      page: this.page,
+      onboarding: this.onboarding,
+      counts: { queue: this.store.queue().length, saved: this.store.savedStories().length, events: this.store.eventCount() },
+      rows,
+    };
+    // Never awaited: a stalled app file op must not brick the command loop.
+    this._dumpN = (this._dumpN ?? 0) + 1;
+    const path = this.store.dir + "/debug-" + this._dumpN + ".json";
+    writeTextFile(path, JSON.stringify(dump, null, 1)).catch(() =>
+      writeTextFile(path, JSON.stringify(dump, null, 1)).catch(() => {}));
   }
 
   // -- render --------------------------------------------------------------
