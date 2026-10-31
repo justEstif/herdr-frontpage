@@ -30,8 +30,10 @@ export class Store {
   }
 
   async load() {
-    const snapRaw = await readTextFile(this.dir + "/snapshot.json");
-    const ledgerRaw = (await readTextFile(this.dir + "/ledger.jsonl")) ?? "";
+    let snapRaw = null;
+    let ledgerRaw = "";
+    try { snapRaw = await readTextFile(this.dir + "/snapshot.json"); } catch (_e) { /* absent or unreadable */ }
+    try { ledgerRaw = (await readTextFile(this.dir + "/ledger.jsonl")) ?? ""; } catch (_e) { /* absent */ }
     this._ledgerExpected = ledgerRaw; // compact() truncates against what we read
     this._ledgerExists = ledgerRaw !== null && ledgerRaw !== undefined;
     this._snapExpected = snapRaw; // null only when the snapshot is absent
@@ -95,12 +97,18 @@ export class Store {
       appliedThrough: this.appliedThrough,
     };
     const text = JSON.stringify(snap);
-    await writeTextFile(this.dir + "/snapshot.json", text, this._snapExpected ?? null);
+    // Fire-and-forget durability: memory is the truth; the snapshot write is
+    // full-state so a lost race just means the next compact wins. The app's
+    // file ops can stall indefinitely — never block the UI on them.
     this._snapExpected = text;
-    await writeTextFile(this.dir + "/ledger.jsonl", "", this._ledgerExists ? this._ledgerExpected : null);
     this._dirtyLedger = "";
     this._ledgerExists = true;
     this._ledgerExpected = "";
+    writeTextFile(this.dir + "/snapshot.json", text, this._snapPrev ?? null)
+      .catch(() => writeTextFile(this.dir + "/snapshot.json", text, null).catch(() => {}));
+    this._snapPrev = text;
+    writeTextFile(this.dir + "/ledger.jsonl", "", this._ledgerWasThere ? "" : null).catch(() => {});
+    this._ledgerWasThere = true;
   }
 
   _trimForCap() {
@@ -131,8 +139,7 @@ export class Store {
     try {
       await writeTextFile(this.dir + "/ledger.jsonl", this._dirtyLedger, this._ledgerExists ? prev : null);
       this._ledgerExists = true;
-    } catch (_e) { /* compact() below reconciles */ }
-    if (this._dirtyLedger.length > LEDGER_LIMIT / 2 || this.events.length % 25 === 0) {
+    } catch (_e) { /* compact() below reconciles */ }    if (this._dirtyLedger.length > LEDGER_LIMIT / 2 || this.events.length % 25 === 0) {
       await this.compact();
     }
     return ev;
