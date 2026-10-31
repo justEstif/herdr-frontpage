@@ -1,41 +1,55 @@
 // herdr-frontpage: a Terminal-style personal reading queue that learns from
-// feedback and explains itself. Three pages: Queue, Reading, Capture.
-// Local-only store (store.js), learned ranking (rank.js), why-receipts (w),
-// optional agent pane (a) via pane.split + hc send.
+// feedback and explains itself. One mod, two roles via props().role:
+//   "rail"   — the sidebar: queue (Q1..Qn) + capture as an overlay card.
+//              Keys: j/k · enter (open in the center) · v · c · z.
+//   "reader" — a center tab: the reading view. Keys: h/m/f/u/w/a/n/q · enter
+//              (nothing open: falls through to the top of the rail).
+// The reader (or first) instance owns feed polling; a shared timestamp guard
+// keeps duplicates out. All store mutations flow through the rail copy so the
+// ledger's CAS writes never race. Local-only store (store.js), learned
+// ranking (rank.js), why-receipts (w), optional agent pane (a).
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
-import { theme, exec, hc, run, panes, knownAgents, setShared, notify, nextCommand, writeTextFile } from "herdr";
+import { theme, exec, hc, run, panes, spaces, knownAgents, setShared, shared, notify, nextCommand, writeTextFile, props, focused } from "herdr";
 import { Store, detectTopic, estReadMs } from "./store.js";
 import { buildWeights, rank, whyReceipt } from "./rank.js";
 
 const QUEUE_CAP = 30;
-const FOOT = {
-  queue: "j/k move · enter open · x dismiss · S save · m/f more-less · w why · v saved · u undo · c capture",
-  reading: "h mark · m/f more-less · u undo · w why · a agent · q queue · n next · c capture",
-  capture: "esc back · enter in a field acts",
-};
+const POLL_MS = 15 * 60 * 1000;
+const RAIL_EXPANDED_PX = 300;
+const RAIL_COMPACT_PX = 44;
+const RAIL_MIN_QUEUE_ROWS = 3;
+const AGENT_MIN_WIDTH = 560; // below this: inline why-receipt instead of an agent pane
+const RAIL_FOOT = "j/k move · enter open · v saved · c capture · z rail";
+const RAIL_COMPACT_FOOT = "j/k · enter · z";
+const READER_FOOT = "h mark · m/f more-less · u undo · w why · a agent · n next · q close";
 
 export default class Frontpage extends View {
   init(_props, cx) {
-    this.page = "queue";
+    this.role = (props()?.role) === "reader" ? "reader" : "rail";
     this.store = new Store();
     this.weights = { terms: new Map(), sources: new Map() };
     this.sel = 0;
     this.savedView = false;
-    this.whyFor = null; // story id with its receipt shown inline
-    this.reading = null; // story id
-    this.onboardingLeft = 5;
+    this.whyFor = null;
+    this.width = 0;
     this.flash = null;
-    this.agentPane = null;
-    this.agentAddr = null;
-    this.urlIn = InputState.new({ placeholder: "https:// story url" });
-    this.feedIn = InputState.new({ placeholder: "https:// feed url (rss/atom)" });
-    this.fetchState = null; // {busy, result:{title,text,topic,chars}, error}
-    this.toast = null;
+    this.lastCmdTs = shared("frontpage:cmd")?.ts ?? 0;
     this.h = cx.focus_handle();
 
-    this.urlIn.on("submit", () => this.captureFetch(cx));
-    this.feedIn.on("submit", () => this.subscribeFeed(cx));
+    if (this.role === "rail") {
+      this.captureOpen = false;
+      this.onboardingLeft = 5;
+      this.urlIn = InputState.new({ placeholder: "https:// story url" });
+      this.feedIn = InputState.new({ placeholder: "https:// feed url (rss/atom)" });
+      this.fetchState = null; // {busy, via, result, error}
+      this.urlIn.on("submit", () => this.captureFetch(cx));
+      this.feedIn.on("submit", (_v, cx) => this.subscribeFeed(cx));
+    } else {
+      this.reading = props()?.story ?? null;
+      this.agentPane = null;
+      this.agentAddr = null;
+    }
 
     cx.spawn(async (cx) => {
       try {
@@ -45,25 +59,42 @@ export default class Frontpage extends View {
       }
       this.reweigh();
       this.publish();
+      if (this.role === "reader" && !this.reading) this.reading = this.topStoryId();
       cx.notify();
     });
-    // feed polling, gently
-    cx.timer.every(15 * 60 * 1000, (cx) => cx.spawn(async (cx) => { await this.pollFeeds(); cx.notify(); }));
-    // scriptable keys: "frontpage:<key>" from keys.json or `herdr-app do frontpage.<key>`
+
+    // Feed polling: one owner only — the reader role, else whoever claimed
+    // first. The shared timestamp doubles as the duplicate guard.
+    cx.spawn(async (cx) => {
+      const owner = shared("frontpage:pollOwner");
+      if (!owner || (owner.role !== "reader" && this.role === "reader") || Date.now() - owner.ts > POLL_MS + 60000) {
+        setShared("frontpage:pollOwner", { role: this.role, ts: Date.now() });
+        this.polls = true;
+      }
+    });
+    cx.timer.every(POLL_MS, (cx) => {
+      const owner = shared("frontpage:pollOwner");
+      if (owner && owner.role !== this.role) return;
+      setShared("frontpage:pollOwner", { role: this.role, ts: Date.now() });
+      cx.spawn(async (cx) => { await this.pollFeeds(); cx.notify(); });
+    });
+
+    // Scriptable commands: "frontpage.<cmd>" from keys.json or herdr-app do.
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
         if (!c) continue;
         const raw = c.includes(":") ? c.slice(c.lastIndexOf(":") + 1) : c;
-        const k = { d: "enter", down: "j", up: "k", why: "w", open: "enter", dismiss: "x", save: "S", less: "f", more: "m", undo: "u", saved: "v", capture: "c", agent: "a", mark: "h", next: "n", close: "q", back: "escape", p: "__dump" }[raw] ?? raw;
+        const k = { open: "enter", down: "j", up: "k", why: "w", dismiss: "x", save: "S", less: "f", more: "m", undo: "u", saved: "v", capture: "c", agent: "a", mark: "h", next: "n", close: "q", back: "escape", p: "__dump", focusrail: "__focusrail" }[raw] ?? raw;
         if (k === "__dump") { await this.writeDump(); continue; }
-        this.onKey({ key: k }, cx);
+        if (k === "__focusrail") { this.focusRail(); continue; }
+        if (this.role === "rail" || k === "a" || k === "w") this.onKey({ key: k }, cx);
       }
     });
     this.h.focus();
   }
 
-  // -- data plumbing -------------------------------------------------------
+  // -- shared data plumbing --------------------------------------------------
 
   reweigh() {
     this.weights = buildWeights(this.store.events, (id) => this.store.byId(id));
@@ -78,19 +109,6 @@ export default class Frontpage extends View {
     });
   }
 
-  flashSet(msg, cx) {
-    this.flash = msg;
-    cx.notify();
-    // fade the flash without a redraw loop: next action clears it
-  }
-
-  async act(kind, storyId, target, cx) {
-    await this.store.act(kind, storyId, target);
-    this.reweigh();
-    this.publish();
-    if (cx) cx.notify();
-  }
-
   list() {
     if (this.savedView) {
       return this.store.savedStories().map((s) => ({ story: s, score: 0, parts: [] }));
@@ -98,31 +116,45 @@ export default class Frontpage extends View {
     return rank(this.store.queue(), this.weights).slice(0, QUEUE_CAP);
   }
 
+  topStoryId() {
+    return rank(this.store.queue(), this.weights)[0]?.story.id ?? null;
+  }
+
   story() {
     return this.store.byId(this.reading ?? "") ?? null;
   }
 
-  // -- actions -------------------------------------------------------------
-
-  open(idx, cx) {
-    const item = this.list()[idx];
-    if (!item) return;
-    this.reading = item.story.id;
-    this.page = "reading";
-    this.whyFor = null;
+  flashSet(msg, cx) {
+    this.flash = msg;
     cx.notify();
   }
 
-  async dismiss(sel, cx) {
-    const item = this.list()[sel];
-    if (!item) return;
-    await this.act("skip", item.story.id, undefined, cx);
-    this.clampSel();
+  /** Reader copies don't write the store; they hand the action to the rail
+   *  via shared state and the rail applies it on its next render. */
+  request(cmd, cx) {
+    setShared("frontpage:cmd", { ...cmd, ts: Date.now() });
+    if (cx) cx.notify();
   }
 
-  clampSel() {
-    const n = this.list().length;
-    if (this.sel >= n) this.sel = Math.max(0, n - 1);
+  applyRemoteCmds(cx) {
+    const cmd = shared("frontpage:cmd");
+    if (!cmd || cmd.ts === this.lastCmdTs) return;
+    this.lastCmdTs = cmd.ts;
+    if (cmd.kind === "undo") {
+      this.undo(cx);
+      return;
+    }
+    if (cmd.kind) {
+      this.act(cmd.kind, cmd.story, cmd.target, cx);
+      this.flash = "from reader: " + cmd.kind;
+    }
+  }
+
+  async act(kind, storyId, target, cx) {
+    await this.store.act(kind, storyId, target);
+    this.reweigh();
+    this.publish();
+    if (cx) cx.notify();
   }
 
   async undo(cx) {
@@ -133,46 +165,44 @@ export default class Frontpage extends View {
     cx.notify();
   }
 
-  async agentToggle(cx) {
-    if (this.agentAddr) {
-      run("pane.close", { pane: this.agentPane });
-      this.agentPane = null;
-      this.agentAddr = null;
-      this.flash = "agent off";
-      cx.notify();
-      return;
-    }
-    const agents = await knownAgents();
-    const a = agents.find((x) => x.installed);
-    if (!a) {
-      this.flash = "no installed agent to open";
-      cx.notify();
-      return;
-    }
-    const story = this.page === "reading" ? this.story() : this.list()[this.sel]?.story;
-    if (!story) return;
-    const before = new Set(panes().map((p) => p.pane));
-    run("pane.split", { direction: "right", argv: a.run });
-    this.flash = `opening ${a.name}…`;
-    cx.notify();
-    cx.spawn(async (cx) => {
-      for (let i = 0; i < 24 && !this.agentAddr; i++) {
-        await exec("sleep", ["0.5"]);
-        const fresh = panes().find((p) => !before.has(p.pane) && p.terminal);
-        if (fresh) {
-          this.agentPane = fresh.pane;
-          this.agentAddr = fresh.terminal;
-          const prompt = `ask about this story: "${story.title}" (${story.url})`;
-          await hc(["send", this.agentAddr, prompt]);
-          this.flash = `agent on (${a.name})`;
-        }
-      }
-      if (!this.agentAddr) this.flash = "agent pane never appeared";
-      cx.notify();
-    });
+  // -- rail: open into the center -------------------------------------------
+
+  focusRail() {
+    const p = panes().find((x) => x.mod === "frontpage" && (x.props?.role ?? "rail") === "rail");
+    if (p) run("pane.focus", { pane: p.pane });
   }
 
-  // -- capture -------------------------------------------------------------
+  open(idx, cx) {
+    const item = this.list()[idx];
+    if (!item) return;
+    const st = item.story;
+    const name = "read: " + (st.title || st.url).slice(0, 40);
+    const space = spaces().find((s) => s.tabs?.some((tb) => tb.id === focusedTabId())) ?? spaces()[0];
+    const existing = space?.tabs?.find((tb) => tb.name === name);
+    if (existing) run("tab.select", { id: existing.id });
+    else run("tab.new", { name, mod: "frontpage", props: { role: "reader", story: st.id } });
+    // opening a tab moves focus to the center; nothing else to do
+    if (cx) cx.notify();
+  }
+
+  // -- rail: z cycles expanded -> compact -> hidden -> expanded --------------
+
+  railCycle(cx) {
+    if (this.width >= RAIL_COMPACT_PX + 20) {
+      run("layout.resize", { id: "sidebar", px: RAIL_COMPACT_PX });
+      this.flash = "rail compact ([ hides it)";
+    } else {
+      run("layout.resize", { id: "sidebar", px: RAIL_EXPANDED_PX });
+      this.flash = "rail expanded";
+    }
+    if (cx) cx.notify();
+  }
+
+  get compact() {
+    return this.width > 0 && this.width < 120;
+  }
+
+  // -- rail: capture overlay -------------------------------------------------
 
   async captureFetch(cx) {
     const url = this.urlIn.value().trim();
@@ -242,16 +272,6 @@ export default class Frontpage extends View {
     cx.notify();
   }
 
-  async readCaptured(cx) {
-    await this.queueCaptured(cx);
-    const last = this.store.stories[this.store.stories.length - 1];
-    if (last) {
-      this.reading = last.id;
-      this.page = "reading";
-      cx.notify();
-    }
-  }
-
   async subscribeFeed(cx) {
     const url = this.feedIn.value().trim();
     if (!/^https?:\/\//.test(url)) return;
@@ -312,10 +332,10 @@ export default class Frontpage extends View {
     }
   }
 
-  // -- onboarding ----------------------------------------------------------
+  // -- onboarding (rail) -----------------------------------------------------
 
   get onboarding() {
-    return !this.store.onboarded && this.store.stories.length > 0;
+    return this.role === "rail" && !this.store.onboarded && this.store.stories.length > 0;
   }
 
   async onboardingRate(kind, cx) {
@@ -330,97 +350,312 @@ export default class Frontpage extends View {
   }
 
   async onboardingFinish(cx) {
-    // show the reorder: everything not rated comes back for one look
     for (const s of this.store.stories) s.dismissed = false;
     await this.store.finishOnboarding();
     this.reweigh();
     this.publish();
-    this.page = "queue";
     this.sel = 0;
-    this.flash = "queue reordered from your ratings — press w on any story";
+    this.flash = "queue reordered from your ratings — press enter to read the top";
     cx.notify();
   }
 
-  // -- keys ----------------------------------------------------------------
+  clampSel() {
+    const n = this.list().length;
+    if (this.sel >= n) this.sel = Math.max(0, n - 1);
+  }
+
+  // -- reader: agent pane ----------------------------------------------------
+
+  async agentToggle(cx) {
+    if (this.agentAddr) {
+      run("pane.close", { pane: this.agentPane });
+      this.agentPane = null;
+      this.agentAddr = null;
+      this.flash = "agent off";
+      cx.notify();
+      return;
+    }
+    const story = this.story();
+    if (!story) return;
+    if (this.width && this.width < AGENT_MIN_WIDTH) {
+      // Tight width: no pane; the inline why-receipt is the fallback.
+      this.whyFor = this.whyFor === story.id ? null : story.id;
+      this.flash = "too narrow for an agent pane — why-receipt inline";
+      cx.notify();
+      return;
+    }
+    const agents = await knownAgents();
+    const a = agents.find((x) => x.installed);
+    if (!a) {
+      this.flash = "no installed agent to open";
+      cx.notify();
+      return;
+    }
+    const before = new Set(panes().map((p) => p.pane));
+    run("pane.split", { direction: "right", argv: a.run });
+    this.flash = `opening ${a.name}…`;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      for (let i = 0; i < 24 && !this.agentAddr; i++) {
+        await exec("sleep", ["0.5"]);
+        const fresh = panes().find((p) => !before.has(p.pane) && p.terminal);
+        if (fresh) {
+          this.agentPane = fresh.pane;
+          this.agentAddr = fresh.terminal;
+          const prompt = `ask about this story: "${story.title}" (${story.url})`;
+          await hc(["send", this.agentAddr, prompt]);
+          this.flash = `agent on (${a.name})`;
+        }
+      }
+      if (!this.agentAddr) this.flash = "agent pane never appeared";
+      cx.notify();
+    });
+  }
+
+  // -- keys ------------------------------------------------------------------
 
   onKey(e, cx) {
     const k = e.key;
-    if (this.page === "capture") {
-      if (k === "escape") { this.page = "queue"; cx.notify(); }
+
+    if (this.role === "rail") return this.railKey(k, cx);
+    return this.readerKey(k, cx);
+  }
+
+  railKey(k, cx) {
+    if (this.captureOpen) {
+      if (k === "escape" || k === "c") { this.captureOpen = false; cx.notify(); }
       return;
     }
     if (this.onboarding) {
-      if (k === "j" || k === "down") { this.sel = Math.min(this.sel + 1, this.list().length - 1); cx.notify(); }
-      else if (k === "k" || k === "up") { this.sel = Math.max(this.sel - 1, 0); cx.notify(); }
-      else if (k === "m") this.onboardingRate("rate", cx) && 0;
-      else if (k === "f") this.onboardingRate("skip", cx) && 0;
-      else if (k === "enter" && this.onboardingLeft <= 0) this.onboardingFinish(cx);
-      return;
-    }
-    if (this.page === "queue") {
       const L = this.list();
       if (k === "j" || k === "down") { this.sel = Math.min(this.sel + 1, L.length - 1); cx.notify(); }
       else if (k === "k" || k === "up") { this.sel = Math.max(this.sel - 1, 0); cx.notify(); }
-      else if (k === "enter") this.open(this.sel, cx);
-      else if (k === "x") this.dismiss(this.sel, cx);
-      else if (k === "S") { const it = L[this.sel]; if (it) this.act("keep", it.story.id, undefined, cx); }
-      else if (k === "m") { const it = L[this.sel]; if (it) this.act("rate", it.story.id, 1, cx); }
-      else if (k === "f") { const it = L[this.sel]; if (it) this.act("rate", it.story.id, -1, cx); }
-      else if (k === "w") { const it = L[this.sel]; if (it) { this.whyFor = this.whyFor === it.story.id ? null : it.story.id; cx.notify(); } }
-      else if (k === "v") { this.savedView = !this.savedView; this.sel = 0; cx.notify(); }
-      else if (k === "u") this.undo(cx);
-      else if (k === "c") { this.page = "capture"; cx.notify(); }
-      else if (k === "a") this.agentToggle(cx);
-    } else if (this.page === "reading") {
-      const st = this.story();
-      if (!st) { this.page = "queue"; cx.notify(); return; }
-      if (k === "q" || k === "escape") { this.page = "queue"; cx.notify(); }
-      else if (k === "h") this.act("mark", st.id, undefined, cx);
-      else if (k === "m") this.act("rate", st.id, 1, cx);
-      else if (k === "f") this.act("rate", st.id, -1, cx);
-      else if (k === "u") this.undo(cx);
-      else if (k === "w") { this.whyFor = this.whyFor === st.id ? null : st.id; cx.notify(); }
-      else if (k === "a") this.agentToggle(cx);
-      else if (k === "n" || k === "x") {
-        const i = this.list().findIndex((it) => it.story.id === st.id);
-        this.page = "queue";
-        this.sel = Math.max(0, i);
-        this.dismiss(this.sel, cx);
-      }
-      else if (k === "c") { this.page = "capture"; cx.notify(); }
+      else if (k === "m") this.onboardingRate("rate", cx);
+      else if (k === "f") this.onboardingRate("skip", cx);
+      else if (k === "enter" && this.onboardingLeft <= 0) this.onboardingFinish(cx);
+      return;
     }
+    const L = this.list();
+    if (k === "j" || k === "down") { this.sel = Math.min(this.sel + 1, L.length - 1); cx.notify(); }
+    else if (k === "k" || k === "up") { this.sel = Math.max(this.sel - 1, 0); cx.notify(); }
+    else if (k === "enter") this.open(this.sel, cx);
+    else if (k === "v") { this.savedView = !this.savedView; this.sel = 0; cx.notify(); }
+    else if (k === "c") { this.captureOpen = true; cx.notify(); }
+    else if (k === "z") this.railCycle(cx);
+  }
+
+  readerKey(k, cx) {
+    const st = this.story();
+    if (k === "enter" && !st) {
+      // Nothing open: fall through to the top of the rail.
+      const top = this.topStoryId();
+      if (top) { this.reading = top; this.whyFor = null; cx.notify(); }
+      else this.flashSet("queue is empty — capture something in the rail (c)", cx);
+      return;
+    }
+    if (!st) {
+      if (k === "q" || k === "escape") run("tab.close", { confirmed: true });
+      return;
+    }
+    if (k === "q" || k === "escape") run("tab.close", { confirmed: true });
+    else if (k === "h") this.request({ kind: "mark", story: st.id }, cx);
+    else if (k === "m") this.request({ kind: "rate", story: st.id, target: 1 }, cx);
+    else if (k === "f") this.request({ kind: "rate", story: st.id, target: -1 }, cx);
+    else if (k === "u") cx.spawn(async (cx) => { /* undo is rail-owned */ this.undoRemote(cx); });
+    else if (k === "w") { this.whyFor = this.whyFor === st.id ? null : st.id; cx.notify(); }
+    else if (k === "a") this.agentToggle(cx);
+    else if (k === "n" || k === "x") this.readerNext(cx);
+  }
+
+  async undoRemote(cx) {
+    setShared("frontpage:cmd", { kind: "undo", ts: Date.now() });
+    cx.notify();
+  }
+
+  readerNext(cx) {
+    const st = this.story();
+    this.request({ kind: "skip", story: st.id }, cx);
+    const next = rank(this.store.queue(), this.weights).find((it) => it.story.id !== st.id);
+    if (next) { this.reading = next.story.id; this.whyFor = null; }
+    else run("tab.close", { confirmed: true });
+    cx.notify();
   }
 
   /** UI-structure evidence for scripts: rendered rows, counts, receipts. */
   async writeDump() {
-    const rows = this.list().map((it, i) => ({
-      i,
-      selected: i === this.sel,
-      title: it.story.title,
-      source: it.story.source,
-      mins: Math.max(1, Math.round(it.story.readMs / 60000)),
-      score: Number(it.score.toFixed(2)),
-      why: this.whyFor === it.story.id ? whyReceipt(it.story, this.weights) : null,
-    }));;
+    const rows = this.role === "rail"
+      ? this.list().map((it, i) => ({
+        i,
+        label: `Q${i + 1}`,
+        selected: i === this.sel,
+        title: it.story.title,
+        source: it.story.source,
+        mins: Math.max(1, Math.round(it.story.readMs / 60000)),
+        score: Number(it.score.toFixed(2)),
+        why: this.whyFor === it.story.id ? whyReceipt(it.story, this.weights) : null,
+      }))
+      : [{ reading: this.reading, title: this.story()?.title ?? null, why: this.story() ? whyReceipt(this.story(), this.weights) : null }];
     const dump = {
       generatedAt: new Date().toISOString(),
-      page: this.page,
+      role: this.role,
       onboarding: this.onboarding,
+      captureOpen: this.captureOpen ?? false,
       counts: { queue: this.store.queue().length, saved: this.store.savedStories().length, events: this.store.eventCount() },
       rows,
     };
-    // Never awaited: a stalled app file op must not brick the command loop.
     this._dumpN = (this._dumpN ?? 0) + 1;
-    const path = this.store.dir + "/debug-" + this._dumpN + ".json";
+    const path = this.store.dir + "/debug-" + this.role + "-" + this._dumpN + ".json";
     writeTextFile(path, JSON.stringify(dump, null, 1)).catch(() =>
       writeTextFile(path, JSON.stringify(dump, null, 1)).catch(() => {}));
   }
 
-  // -- render --------------------------------------------------------------
+  // -- render ----------------------------------------------------------------
 
-  render(_cx) {
+  render(cx) {
+    if (this.role === "rail") return this.renderRail(cx);
+    return this.renderReader(cx);
+  }
+
+  renderRail(cx) {
+    this.applyRemoteCmds(cx);
     const t = theme();
-    const page = this.onboarding ? this.onboardingPage : this.page;
+    const capture = this.captureOpen;
+    return v_flex()
+      .id("root")
+      .size_full()
+      .bg(t.chrome)
+      .text_size(13)
+      .track_focus(this.h)
+      .on_key_down((e, cx) => this.onKey(e, cx))
+      .on_size_change((size, cx) => { if (size.width !== this.width) { this.width = size.width; cx.notify(); } })
+      .child(this.railHeader(t))
+      .when(this.flash, (el) => el.child(
+        div().px(8).py(1).text_size(10).text_color(t.muted).truncate().child("· " + this.flash)
+      ))
+      .child(this.railQueue(t))
+      .when(capture, (el) => el.child(this.captureCard(t)))
+      .child(this.railFooter(t));
+  }
+
+  railHeader(t) {
+    const view = this.savedView ? "saved" : "queue";
+    return h_flex()
+      .h(26)
+      .px(8)
+      .items_center()
+      .gap(6)
+      .border_b(1)
+      .border_color(t.border)
+      .child(div().font_semibold().text_size(11).text_color(t.accent).child("frontpage"))
+      .child(div().text_size(10).text_color(t.dim).child(view))
+      .child(div().flex_1())
+      .child(div().text_size(10).text_color(t.muted).child(`${this.store.queue().length}`));
+  }
+
+  railQueue(t) {
+    const items = this.list();
+    if (!items.length) {
+      return div().flex_1().p(8).child(
+        div().text_size(11).text_color(t.dim).child(
+          this.savedView ? "no saved stories yet" : "queue empty — c captures"
+        )
+      );
+    }
+    // Compact rails never fully hide the queue: at least RAIL_MIN_QUEUE_ROWS
+    // rows, then a "queue: N more" line.
+    const maxRows = this.compact ? Math.max(RAIL_MIN_QUEUE_ROWS, 0) : items.length;
+    const shown = items.slice(0, maxRows);
+    const more = items.length - shown.length;
+    const rows = shown.map((it, i) => this.railRow(t, it, i));
+    if (more > 0) {
+      rows.push(div().px(8).py(1).text_size(10).text_color(t.muted).truncate().child(`queue: ${more} more`));
+    }
+    return v_flex().flex_1().min_h(0).overflow_y_scrollbar().children(rows);
+  }
+
+  railRow(t, it, i) {
+    const st = it.story;
+    const sel = i === this.sel;
+    const label = `Q${i + 1}`;
+    if (this.compact) {
+      return h_flex()
+        .id(`q-${st.id}`)
+        .px(4).py(1).items_center().gap(4)
+        .when(sel, (el) => el.bg(t.selected))
+        .on_click((_e, cx) => { this.sel = i; cx.notify(); })
+        .child(div().text_size(10).text_color(sel ? t.accent : t.dim).child(label))
+        .child(div().flex_1().min_w(0).truncate().text_size(10).text_color(sel ? t.foreground : t.muted).child(st.title || st.url));
+    }
+    const mins = Math.max(1, Math.round(st.readMs / 60000));
+    const row = v_flex()
+      .id(`q-${st.id}`)
+      .px(8).py(2).min_h(22).justify_center()
+      .when(sel, (el) => el.bg(t.selected))
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => { this.sel = i; cx.notify(); this.open(i, cx); })
+      .child(
+        h_flex().gap(6).items_center()
+          .child(div().w(20).text_size(10).text_color(sel ? t.accent : t.dim).child(label))
+          .child(div().w(6).text_color(sel ? t.accent : t.dim).child(sel ? ">" : " "))
+          .child(div().flex_1().min_w(0).truncate().text_color(sel ? t.foreground : t.muted).child(st.title || st.url))
+          .child(div().w(70).truncate().text_size(10).text_color(t.dim).child(st.source))
+          .child(div().w(26).text_right().text_size(10).text_color(t.dim).child(`${mins}m`))
+      );
+    if (this.whyFor === st.id) {
+      row.child(div().pl(28).text_size(10).text_color(t.muted).truncate().child("> " + whyReceipt(st, this.weights)));
+    }
+    return row;
+  }
+
+  railFooter(t) {
+    return h_flex()
+      .h(20)
+      .px(8)
+      .items_center()
+      .border_t(1)
+      .border_color(t.border)
+      .child(div().text_size(9.5).text_color(t.dim).truncate().flex_1()
+        .child(this.onboarding ? "m more · f less · enter when done" : (this.compact ? RAIL_COMPACT_FOOT : RAIL_FOOT)));
+  }
+
+  // Capture expands as a card over the queue's tail — it never replaces the
+  // list (the queue rows above stay visible).
+  captureCard(t) {
+    const fs = this.fetchState;
+    return v_flex()
+      .m(6).mt(0).p(8).gap(6)
+      .rounded(7)
+      .bg(t.popover)
+      .border_1()
+      .border_color(t.accent)
+      .child(div().text_size(11).font_semibold().text_color(t.foreground).child("> add a story"))
+      .child(
+        h_flex().gap(6).child(
+          Input.new(this.urlIn).flex_1().min_w(0).h(26).px(8).rounded(6).border_1().border_color(t.input).bg(t.surface).text_size(11.5).text_color(t.foreground)
+        ).child(this.btn(t, "fetch", (_e, cx) => this.captureFetch(cx)))
+      )
+      .when(fs?.busy, (el) => el.child(div().text_size(10).text_color(t.muted).child("fetching…")))
+      .when(fs?.error, (el) => el.child(div().text_size(10).text_color(t.blocked).truncate().child(fs.error)))
+      .when(fs?.result, (el) => el.child(
+        v_flex().gap(4)
+          .child(div().text_size(11).text_color(t.foreground).truncate().child(fs.result.title))
+          .child(div().text_size(10).text_color(t.dim).truncate().child(`> ${fs.via} · ${fs.result.chars} chars · ${fs.result.topic}`))
+          .child(this.btn(t, "queue it", (_e, cx) => this.queueCaptured(cx)))
+      ))
+      .child(div().text_size(11).font_semibold().text_color(t.foreground).child("> add a feed"))
+      .child(
+        h_flex().gap(6).child(
+          Input.new(this.feedIn).flex_1().min_w(0).h(26).px(8).rounded(6).border_1().border_color(t.input).bg(t.surface).text_size(11.5).text_color(t.foreground)
+        ).child(this.btn(t, "subscribe", (_e, cx) => this.subscribeFeed(cx)))
+      )
+      .child(div().text_size(10).text_color(t.dim).child("esc closes · queue stays above"))
+      .children(this.store.sources.slice(0, 3).map((s) =>
+        div().text_size(10).text_color(t.muted).truncate().child(`> ${s.title} · every ${s.pollHours}h`)));
+  }
+
+  renderReader(cx) {
+    const t = theme();
+    const st = this.story();
     return v_flex()
       .id("root")
       .size_full()
@@ -428,123 +663,45 @@ export default class Frontpage extends View {
       .text_size(13)
       .track_focus(this.h)
       .on_key_down((e, cx) => this.onKey(e, cx))
-      .child(this.header(t, page))
+      .on_size_change((size, cx) => { if (size.width !== this.width) { this.width = size.width; cx.notify(); } })
       .when(this.flash, (el) => el.child(
-        div().px(10).py(2).text_size(11).text_color(t.muted).child("· " + this.flash + " ·")
+        div().px(10).py(1).text_size(10).text_color(t.muted).truncate().child("· " + this.flash)
       ))
-      .when(page === "queue" || this.onboarding, (el) => el.child(this.queueBody(t)).flex_1())
-      .when(page === "reading", (el) => el.child(this.readingBody(t)).flex_1())
-      .when(page === "capture", (el) => el.child(this.captureBody(t)).flex_1())
-      .child(this.footer(t, page));
+      .child(st ? this.readingBody(t, st) : this.readerEmpty(t))
+      .child(this.readerFooter(t, st));
   }
 
-  header(t, page) {
-    const names = [["queue", "queue"], ["reading", "reading"], ["capture", "capture"]];
-    const counts = `queue ${this.store.queue().length} · saved ${this.store.savedStories().length} · events ${this.store.eventCount()}`;
-    return h_flex()
-      .h(30)
-      .px(10)
-      .items_center()
-      .gap(8)
-      .bg(t.chrome)
-      .border_b(1)
-      .border_color(t.border)
-      .child(div().font_semibold().text_color(t.accent).text_size(12).child("read |"))
-      .children(names.map(([id, label]) =>
-        h_flex()
-          .id(`pg-${id}`)
-          .px(6)
-          .rounded(4)
-          .hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => { if (!this.onboarding) { this.page = id; cx.notify(); } })
-          .child(div().text_size(12).text_color(page === id ? t.foreground : t.dim).child(label))
-      ))
-      .child(div().flex_1())
-      .child(div().text_size(11).text_color(t.dim).child(counts))
-      .child(div().text_size(11).text_color(t.muted).child(this.agentAddr ? "agent on" : "local"));
+  readerEmpty(t) {
+    const top = rank(this.store.queue(), this.weights).slice(0, 3);
+    return v_flex().flex_1().p(14).gap(8)
+      .child(div().text_color(t.dim).child("nothing open — enter opens the top of the rail"))
+      .children(top.map((it, i) =>
+        h_flex().id(`top-${it.story.id}`).gap(8).on_click((_e, cx) => { this.reading = it.story.id; cx.notify(); })
+          .child(div().text_size(11).text_color(t.accent).child(`Q${i + 1}`))
+          .child(div().text_size(11).text_color(t.muted).truncate().flex_1().child(it.story.title || it.story.url))));
   }
 
-  footer(t, page) {
-    const streak = `day ${this.dayStreak()}`;
-    return h_flex()
-      .h(24)
-      .px(10)
-      .items_center()
-      .bg(t.chrome)
-      .border_t(1)
-      .border_color(t.border)
-      .child(div().text_size(11).text_color(t.dim).flex_1().child(this.onboarding ? "m more like this · f less · j/k move · enter when done" : FOOT[page]))
-      .child(div().text_size(11).text_color(t.muted).child(`${streak} · ${this.store.eventCount()} events · local`));
-  }
-
-  /** Consecutive days (UTC) with at least one non-undo ledger event, ending today. */
-  dayStreak() {
-    const days = new Set(
-      this.store.events.filter((e) => e.kind !== "undo").map((e) => Math.floor(e.ts / 86400000))
-    );
-    if (!days.size) return 0;
-    const today = Math.floor(Date.now() / 86400000);
-    let streak = days.has(today) ? 1 : 0;
-    for (let d = today - 1; days.has(d); d--) streak += 1;
-    return streak;
-  }
-
-  queueBody(t) {
-    const items = this.list();
-    if (!items.length) {
-      return div().flex_1().p(12).child(
-        div().text_color(t.dim).child(this.savedView ? "no saved stories yet — S on the queue saves one" : "queue is empty — press c to capture a url or subscribe a feed")
-      );
-    }
-    const rows = items.map((it, i) => {
-      const st = it.story;
-      const sel = i === this.sel;
-      const mins = Math.max(1, Math.round(st.readMs / 60000));
-      const row = v_flex()
-        .id(`q-${st.id}`)
-        .px(10)
-        .py(3)
-        .min_h(24)
-        .justify_center()
-        .when(sel, (el) => el.bg(t.selected))
-        .hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => { this.sel = i; cx.notify(); })
-        .child(
-          h_flex().gap(10).items_center().child(
-            div().w(4).text_color(sel ? t.accent : t.dim).child(sel ? ">" : " ")
-          ).child(
-            div().flex_1().truncate().text_color(sel ? t.foreground : t.muted).child(st.title || st.url)
-          ).child(
-            div().w(110).truncate().text_color(t.dim).text_size(11).child(st.source)
-          ).child(
-            div().w(48).text_right().text_color(t.dim).text_size(11).child(`${mins}m`)
-          ).child(
-            div().w(64).text_right().text_size(11).text_color(it.parts?.length && it.parts[0]?.delta >= 0 ? t.foreground : t.dim)
-              .child(it.parts?.length ? fmtDelta(it.score) : "-")
-          )
-        );
-      if (this.whyFor === st.id) {
-        row.child(div().pl(14).text_size(11).text_color(t.muted).child("why: " + whyReceipt(st, this.weights)));
-      }
-      return row;
-    });
-    return v_flex().flex_1().min_h(0).overflow_y_scrollbar().children(rows);
-  }
-
-  readingBody(t) {
-    const st = this.story();
-    if (!st) return div().flex_1().p(12).child(div().text_color(t.dim).child("nothing open"));
+  readingBody(t, st) {
     const mins = Math.max(1, Math.round(st.readMs / 60000));
+    const narrow = this.width && this.width < AGENT_MIN_WIDTH;
     return v_flex()
       .flex_1()
       .min_h(0)
       .child(
         h_flex().px(12).pt(8).pb(4).gap(10).items_center().child(
-          div().text_size(15).font_semibold().text_color(t.foreground).flex_1().truncate().child(st.title)
+          div().text_size(15).font_semibold().text_color(t.foreground).flex_1().min_w(0).truncate().child(st.title)
         ).child(
           div().text_size(11).text_color(t.dim).child(`${st.source} · ${mins}m`)
         )
       )
+      .when(this.agentAddr, (el) => el.child(
+        // Agent pane indicator: gutter + '>' marker, no [brackets]; '…' when tight.
+        h_flex().mx(12).mb(2).px(6).py(2).gap(6).items_center()
+          .rounded(6).border_1().border_color(t.border).bg(t.surface)
+          .child(div().w(8).text_size(11).text_color(t.accent).child(">"))
+          .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.muted)
+            .child(narrow ? `agent reading: ${st.title.slice(0, 24)}…` : `agent asked about: ${st.title}`))
+      ))
       .child(
         div().flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(6).child(
           st.text
@@ -552,62 +709,40 @@ export default class Frontpage extends View {
             : div().text_color(t.dim).text_size(12).child(st.textDropped ? "(text dropped to save space — open the url)" : "(no extracted text — open the url)")
         )
       )
-      .child(
-        div().px(12).py(3).text_size(11).text_color(t.muted).border_t(1).border_color(t.border)
-          .child("why: " + whyReceipt(st, this.weights))
-      );
+      .when(this.whyFor === st.id || narrow, (el) => el.child(
+        div().px(12).py(2).text_size(10.5).text_color(t.muted).border_t(1).border_color(t.border).truncate()
+          .child("> why: " + whyReceipt(st, this.weights))
+      ));
   }
 
-  captureBody(t) {
-    const fs = this.fetchState;
-    return v_flex().flex_1().min_h(0).overflow_y_scrollbar().p(12).gap(10)
-      .child(div().text_size(12).font_semibold().text_color(t.foreground).child("add a story"))
-      .child(
-        h_flex().gap(8).child(
-          Input.new(this.urlIn).flex_1().h(30).px(10).rounded(7).border_1().border_color(t.input).bg(t.surface).text_size(12.5).text_color(t.foreground)
-        ).child(this.btn(t, "fetch", (_e, cx) => this.captureFetch(cx)))
-      )
-      .when(fs?.busy, (el) => el.child(div().text_size(11).text_color(t.muted).child("fetching…")))
-      .when(fs?.error, (el) => el.child(div().text_size(11).text_color(t.blocked).child(fs.error)))
-      .when(fs?.result, (el) => el.child(
-        v_flex().gap(6).px(10).py(8).rounded(7).bg(t.surface)
-          .child(div().text_size(12).text_color(t.foreground).truncate().child(fs.result.title))
-          .child(div().text_size(11).text_color(t.dim).child(`fetched via ${fs.via} · ${fs.result.chars} chars · topic: ${fs.result.topic}`))
-          .child(h_flex().gap(8)
-            .child(this.btn(t, "queue it", (_e, cx) => this.queueCaptured(cx)))
-            .child(this.btn(t, "read now", (_e, cx) => this.readCaptured(cx))))
-      ))
-      .child(div().text_size(12).font_semibold().text_color(t.foreground).mt(6).child("add a source"))
-      .child(
-        h_flex().gap(8).child(
-          Input.new(this.feedIn).flex_1().h(30).px(10).rounded(7).border_1().border_color(t.input).bg(t.surface).text_size(12.5).text_color(t.foreground)
-        ).child(this.btn(t, "subscribe", (_e, cx) => this.subscribeFeed(cx)))
-      )
-      .child(div().text_size(12).font_semibold().text_color(t.foreground).mt(6).child("your sources"))
-      .children(this.store.sources.length
-        ? this.store.sources.map((s) =>
-          h_flex().id(`src-${s.url}`).gap(10).items_center().py(2)
-            .child(div().w(160).truncate().text_color(t.foreground).text_size(12).child(s.title))
-            .child(div().flex_1().text_size(11).text_color(t.dim).child(`every ${s.pollHours}h · kept ${s.kept} / skipped ${s.skipped}`))
-            .child(this.btn(t, "x", (_e, cx) => cx.spawn(async (cx) => { await this.store.removeSource(s.url); this.publish(); cx.notify(); }))))
-        : [div().text_size(11).text_color(t.dim).child("none yet")]);
+  readerFooter(t, st) {
+    return h_flex()
+      .h(22)
+      .px(10)
+      .items_center()
+      .gap(10)
+      .bg(t.chrome)
+      .border_t(1)
+      .border_color(t.border)
+      .child(div().text_size(10.5).text_color(t.dim).flex_1().truncate().child(st ? READER_FOOT : "enter open top · q close"))
+      .child(div().text_size(10.5).text_color(t.muted).child(this.agentAddr ? "agent on" : "local"));
   }
 
   btn(t, label, onClick) {
     return h_flex()
       .id(`btn-${label}`)
       .px(8)
-      .h(28)
+      .h(24)
       .items_center()
-      .rounded(7)
+      .rounded(6)
       .border_1()
       .border_color(t.border)
       .hover((s) => s.bg(t.hover))
       .on_click(onClick)
-      .child(div().text_size(11.5).text_color(t.foreground).child(label));
+      .child(div().text_size(10.5).text_color(t.foreground).child(label));
   }
 }
 
-function fmtDelta(n) {
-  return (n >= 0 ? "+" : "") + n.toFixed(1);
+function focusedTabId() {
+  return focused()?.tab?.id ?? null;
 }
