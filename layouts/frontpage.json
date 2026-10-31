@@ -2,8 +2,24 @@
   "id": "root",
   "type": "column",
   "theme": "ink",
+  "divider": { "width": 1, "color": "border" },
   "children": [
-    { "id": "status", "type": "block", "size": { "px": 26 }, "content": { "mod": "frontpage-status" } },
-    { "id": "front", "type": "block", "content": { "mod": "frontpage" } }
+    { "id": "body", "type": "row",
+      "children": [
+        { "id": "sidebar", "type": "column", "size": { "px": 300 }, "min": 40, "max": 480,
+          "divider": { "width": 1, "color": "border" },
+          "children": [
+            { "id": "rail", "type": "block", "content": { "mod": "frontpage", "props": { "role": "rail" } } }
+          ] },
+        { "id": "work", "type": "column",
+          "children": [
+            { "id": "tabs", "type": "block", "size": { "px": 30 }, "content": { "mod": "tabs" } },
+            { "id": "reader", "type": "block", "content": { "tab": "active" },
+              "pane": { "gap": 6, "radius": 6, "background": "surface",
+                        "border": { "width": 1, "color": "border" },
+                        "focus": { "width": 1, "color": "accent" } } }
+          ] }
+      ] },
+    { "id": "status", "type": "block", "size": { "px": 24 }, "content": { "mod": "frontpage-status" } }
   ]
 }

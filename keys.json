@@ -1,0 +1,6 @@
+{
+  "layout:frontpage": {
+    "[": "layout.toggle:sidebar",
+    "/": "frontpage.focusrail"
+  }
+}
